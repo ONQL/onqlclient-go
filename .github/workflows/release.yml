@@ -2,9 +2,13 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+    tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. v0.1.0). Leave empty to read from VERSION file."
+        required: false
 
 jobs:
   test:
@@ -14,10 +18,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.21"
-      - name: Verify module
-        run: go build ./...
-      - name: Vet
-        run: go vet ./...
+      - run: go build ./...
+      - run: go vet ./...
 
   release:
     needs: test
@@ -26,17 +28,50 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            V="${{ github.event.inputs.version }}"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            V="${GITHUB_REF_NAME}"
+          elif [ -f VERSION ]; then
+            V="v$(cat VERSION | tr -d '[:space:]')"
+          else
+            echo "No version source (no tag, no VERSION file, no workflow input); skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Check if tag already exists
+        id: gate
+        if: steps.ver.outputs.skip != 'true'
+        run: |
+          if git rev-parse "refs/tags/${{ steps.ver.outputs.version }}" >/dev/null 2>&1; then
+            echo "already=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create tag
+        if: steps.ver.outputs.skip != 'true' && steps.gate.outputs.already == 'false' && !startsWith(github.ref, 'refs/tags/')
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.ver.outputs.version }}" -m "Release ${{ steps.ver.outputs.version }}"
+          git push origin "${{ steps.ver.outputs.version }}"
+
       - name: Create GitHub release
+        if: steps.ver.outputs.skip != 'true' && steps.gate.outputs.already == 'false'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.ver.outputs.version }}
           generate_release_notes: true
 
-  # pkg.go.dev indexes modules automatically on tag push; no upload step needed.
-  trigger-proxy:
-    needs: release
-    runs-on: ubuntu-latest
-    steps:
       - name: Warm pkg.go.dev / proxy cache
+        if: steps.ver.outputs.skip != 'true'
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          curl -fsSL "https://proxy.golang.org/github.com/ONQL/onqlclient-go/@v/${TAG}.info" || true
+          curl -fsSL "https://proxy.golang.org/github.com/!o!n!q!l/onqlclient-go/@v/${{ steps.ver.outputs.version }}.info" || true
