@@ -4,8 +4,22 @@ Official Go client for the ONQL database server.
 
 ## Installation
 
+### Latest tagged release (via the Go module proxy)
+
 ```bash
-go get github.com/onql/onql-go
+go get github.com/ONQL/onqlclient-go
+```
+
+### A specific version
+
+```bash
+go get github.com/ONQL/onqlclient-go@v0.1.0
+```
+
+### Latest `main` (no tag required)
+
+```bash
+go get github.com/ONQL/onqlclient-go@main
 ```
 
 ## Quick Start
@@ -17,7 +31,7 @@ import (
 	"fmt"
 	"log"
 
-	onql "github.com/onql/onql-go"
+	onql "github.com/ONQL/onqlclient-go"
 )
 
 func main() {
@@ -175,7 +189,7 @@ import (
     "fmt"
     "log"
 
-    onql "github.com/onql/onql-go"
+    onql "github.com/ONQL/onqlclient-go"
 )
 
 type User struct {
