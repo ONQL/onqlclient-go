@@ -232,9 +232,10 @@ func (c *Client) Close() error {
 // ---------------------------------------------------------------------------
 // Direct ORM-style API (Insert / Update / Delete / Onql / Build)
 //
-// The `path` argument is a dotted string:
-//   "mydb.users"        -> table `users` in database `mydb`
-//   "mydb.users.u1"     -> record with id `u1` in `mydb.users`
+// `query` arguments are ONQL expression *strings*, e.g.
+//    "mydb.users[id=\"u1\"].id"
+//    "mydb.orders[status=\"pending\"]"
+// Use Client.Build(template, values...) to substitute $1, $2, ...
 // ---------------------------------------------------------------------------
 
 // OnqlOption configures an optional parameter on an ORM-style call.
@@ -244,6 +245,7 @@ type onqlOptions struct {
 	protopass string
 	ctxKey    string
 	ctxValues []string
+	ids       []string
 }
 
 // WithProtopass sets a custom proto-pass profile.
@@ -259,33 +261,18 @@ func WithContext(key string, values []string) OnqlOption {
 	}
 }
 
+// WithIDs supplies explicit record IDs as an alternative to a query string
+// on Update/Delete.
+func WithIDs(ids []string) OnqlOption {
+	return func(o *onqlOptions) { o.ids = ids }
+}
+
 func applyOptions(opts []OnqlOption) *onqlOptions {
-	o := &onqlOptions{protopass: "default", ctxValues: []string{}}
+	o := &onqlOptions{protopass: "default", ctxValues: []string{}, ids: []string{}}
 	for _, opt := range opts {
 		opt(o)
 	}
 	return o
-}
-
-// parsePath splits "db.table" or "db.table.id" into (db, table, id).
-// If requireID is true, the path must contain an id segment.
-func parsePath(path string, requireID bool) (db, table, id string, err error) {
-	if path == "" {
-		return "", "", "", errors.New(`onql: path must be a non-empty string like "db.table" or "db.table.id"`)
-	}
-	parts := strings.SplitN(path, ".", 3)
-	if len(parts) < 2 {
-		return "", "", "", fmt.Errorf("onql: path %q must contain at least \"db.table\"", path)
-	}
-	db = parts[0]
-	table = parts[1]
-	if len(parts) == 3 {
-		id = parts[2]
-	}
-	if requireID && id == "" {
-		return "", "", "", fmt.Errorf("onql: path %q must include a record id: \"db.table.id\"", path)
-	}
-	return
 }
 
 // envelope is the standard {error, data} response envelope.
@@ -312,14 +299,9 @@ func processResult(raw string, out interface{}) (json.RawMessage, error) {
 	return env.Data, nil
 }
 
-// Insert inserts a single record into the table identified by `path`.
-// `path` is "db.table" (e.g. "mydb.users"); `data` is a single record
-// (struct, map, or any serde_json::Value-like type).
-func (c *Client) Insert(path string, data interface{}) (json.RawMessage, error) {
-	db, table, _, err := parsePath(path, false)
-	if err != nil {
-		return nil, err
-	}
+// Insert inserts a single record into `db.table`.
+// `data` can be any JSON-serialisable value — struct, map, etc.
+func (c *Client) Insert(db, table string, data interface{}) (json.RawMessage, error) {
 	payload, err := json.Marshal(map[string]interface{}{
 		"db":      db,
 		"table":   table,
@@ -335,21 +317,19 @@ func (c *Client) Insert(path string, data interface{}) (json.RawMessage, error) 
 	return processResult(resp.Payload, nil)
 }
 
-// Update updates the record identified by `path` (e.g. "mydb.users.u1").
-// Optional parameters: WithProtopass(...).
-func (c *Client) Update(path string, data interface{}, opts ...OnqlOption) (json.RawMessage, error) {
-	db, table, id, err := parsePath(path, true)
-	if err != nil {
-		return nil, err
-	}
+// Update updates records in `db.table` matching `query` (or the explicit IDs
+// supplied via WithIDs). `query` is an ONQL expression string — pass "" when
+// using WithIDs.
+// Optional parameters: WithProtopass(...), WithIDs(...).
+func (c *Client) Update(db, table string, data interface{}, query string, opts ...OnqlOption) (json.RawMessage, error) {
 	o := applyOptions(opts)
 	payload, err := json.Marshal(map[string]interface{}{
 		"db":        db,
 		"table":     table,
 		"records":   data,
-		"query":     "",
+		"query":     query,
 		"protopass": o.protopass,
-		"ids":       []string{id},
+		"ids":       o.ids,
 	})
 	if err != nil {
 		return nil, err
@@ -361,20 +341,16 @@ func (c *Client) Update(path string, data interface{}, opts ...OnqlOption) (json
 	return processResult(resp.Payload, nil)
 }
 
-// Delete deletes the record identified by `path` (e.g. "mydb.users.u1").
-// Optional parameters: WithProtopass(...).
-func (c *Client) Delete(path string, opts ...OnqlOption) (json.RawMessage, error) {
-	db, table, id, err := parsePath(path, true)
-	if err != nil {
-		return nil, err
-	}
+// Delete deletes records in `db.table` matching `query` (or WithIDs).
+// Optional parameters: WithProtopass(...), WithIDs(...).
+func (c *Client) Delete(db, table, query string, opts ...OnqlOption) (json.RawMessage, error) {
 	o := applyOptions(opts)
 	payload, err := json.Marshal(map[string]interface{}{
 		"db":        db,
 		"table":     table,
-		"query":     "",
+		"query":     query,
 		"protopass": o.protopass,
-		"ids":       []string{id},
+		"ids":       o.ids,
 	})
 	if err != nil {
 		return nil, err
