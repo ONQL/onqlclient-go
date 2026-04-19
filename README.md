@@ -28,70 +28,62 @@ go get github.com/ONQL/onqlclient-go@main
 package main
 
 import (
-	"fmt"
-	"log"
+    "fmt"
+    "log"
 
-	onql "github.com/ONQL/onqlclient-go"
+    onql "github.com/ONQL/onqlclient-go"
 )
 
+type User struct {
+    ID   string `json:"id"`
+    Name string `json:"name"`
+    Age  int    `json:"age"`
+}
+
 func main() {
-	client, err := onql.Connect("localhost", 5656)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer client.Close()
+    client, err := onql.Connect("localhost", 5656)
+    if err != nil { log.Fatal(err) }
+    defer client.Close()
 
-	// Execute a query
-	result, err := client.SendRequest("onql", `{"db":"mydb","table":"users","query":"name = \"John\""}`)
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println(result.Payload)
+    if _, err := client.Insert("mydb.users",
+        User{ID: "u1", Name: "John", Age: 30}); err != nil {
+        log.Fatal(err)
+    }
 
-	// Subscribe to live updates
-	rid, err := client.Subscribe("", `name = "John"`, func(rid, keyword, payload string) {
-		fmt.Println("Update:", payload)
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
+    var users []User
+    if _, err := client.Onql("select * from mydb.users where age > 18", &users); err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(users)
 
-	// Unsubscribe
-	client.Unsubscribe(rid)
+    client.Update("mydb.users.u1", map[string]any{"age": 31})
+    client.Delete("mydb.users.u1")
 }
 ```
 
 ## API Reference
 
-### `onql.Connect(host, port, ...opts)`
+### `onql.Connect(host, port, ...opts) (*Client, error)`
 
 Creates and returns a connected client.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `host` | `string` | `"localhost"` | Server hostname |
-| `port` | `int` | `5656` | Server port |
+| `host` | `string` | — | Server hostname |
+| `port` | `int` | — | Server port |
 
 ### Options
 
 ```go
 onql.Connect("localhost", 5656,
-	onql.WithTimeout(10 * time.Second),
-	onql.WithBufferSize(16 * 1024 * 1024),
+    onql.WithTimeout(10 * time.Second),
+    onql.WithBufferSize(16 * 1024 * 1024),
 )
 ```
 
 ### `client.SendRequest(keyword, payload) (*Response, error)`
 
-Sends a request and waits for a response.
-
-### `client.Subscribe(onquery, query, callback) (string, error)`
-
-Opens a streaming subscription. Returns the subscription ID.
-
-### `client.Unsubscribe(rid) error`
-
-Stops receiving events for a subscription.
+Sends a raw request frame and waits for the response.
 
 ### `client.Close() error`
 
@@ -99,58 +91,45 @@ Closes the connection.
 
 ## Direct ORM-style API
 
-In addition to raw `SendRequest`, the client exposes convenience methods that
-build the standard payload envelopes for common operations and unwrap the
-server's `{error, data}` response automatically.
+On top of raw `SendRequest`, the client exposes convenience methods that build
+the standard payload envelopes for `Insert` / `Update` / `Delete` / `Onql` and
+unwrap the server's `{error, data}` response automatically — returning an
+error on a non-empty `error`, or the decoded `data` bytes on success.
 
-Call `client.Setup(db)` once to bind a default database name; every subsequent
-`Insert` / `Update` / `Delete` / `Onql` call will use it.
+The `path` argument is a **dotted string** identifying what you're operating
+on:
 
-### `client.Setup(db string) *Client`
+| Path shape | Meaning |
+|------------|---------|
+| `"mydb.users"` | The `users` table in database `mydb` (used by `Insert`) |
+| `"mydb.users.u1"` | The record with id `u1` (used by `Update` / `Delete`) |
 
-Sets the default database. Returns the receiver, so calls can be chained.
+### `client.Insert(path string, data interface{}) (json.RawMessage, error)`
+
+Insert a **single** record.
 
 ```go
-client.Setup("mydb")
+client.Insert("mydb.users",
+    map[string]any{"id": "u1", "name": "John", "age": 30})
 ```
 
-### `client.Insert(table string, data interface{}) (json.RawMessage, error)`
+### `client.Update(path string, data interface{}, ...opts) (json.RawMessage, error)`
 
-Insert one record or a slice of records.
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `table` | `string` | Target table |
-| `data` | `any` | A struct/map, or a slice of them |
-
-Returns the decoded `data` field from the server envelope as raw JSON.
-Returns an error if the server sets a non-empty `error` field.
+Update the record at `path`. Options: `WithProtopass(string)`.
 
 ```go
-_, err := client.Insert("users", map[string]any{"name": "John", "age": 30})
-_, err := client.Insert("users", []map[string]any{{"name": "A"}, {"name": "B"}})
+client.Update("mydb.users.u1", map[string]any{"age": 31})
+client.Update("mydb.users.u1",
+    map[string]any{"active": false},
+    onql.WithProtopass("admin"))
 ```
 
-### `client.Update(table, data, query, ...opts) (json.RawMessage, error)`
+### `client.Delete(path string, ...opts) (json.RawMessage, error)`
 
-Update records matching `query`.
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `WithProtopass(string)` | `"default"` | Proto-pass profile |
-| `WithIDs([]string)` | `[]` | Explicit record IDs |
+Delete the record at `path`.
 
 ```go
-client.Update("users", map[string]any{"age": 31}, map[string]any{"name": "John"})
-client.Update("users", data, query, onql.WithProtopass("admin"))
-```
-
-### `client.Delete(table, query, ...opts) (json.RawMessage, error)`
-
-Delete records matching `query`. Accepts the same options as `Update`.
-
-```go
-client.Delete("users", map[string]any{"active": false})
+client.Delete("mydb.users.u1")
 ```
 
 ### `client.Onql(query string, out interface{}, ...opts) (json.RawMessage, error)`
@@ -165,7 +144,7 @@ unmarshalled into it (pass a pointer to a struct or slice).
 
 ```go
 var users []User
-_, err := client.Onql("select * from users where age > 18", &users)
+_, err := client.Onql("select * from mydb.users where age > 18", &users)
 ```
 
 ### `client.Build(query string, values ...interface{}) string`
@@ -174,52 +153,11 @@ Replace `$1`, `$2`, … placeholders with values. Strings are double-quoted;
 numeric and boolean values are inlined verbatim.
 
 ```go
-q := client.Build("select * from users where name = $1 and age > $2", "John", 18)
-// -> `select * from users where name = "John" and age > 18`
+q := client.Build("select * from mydb.users where name = $1 and age > $2",
+    "John", 18)
+// -> select * from mydb.users where name = "John" and age > 18
 var rows []User
 _, err := client.Onql(q, &rows)
-```
-
-### Full example
-
-```go
-package main
-
-import (
-    "fmt"
-    "log"
-
-    onql "github.com/ONQL/onqlclient-go"
-)
-
-type User struct {
-    Name string `json:"name"`
-    Age  int    `json:"age"`
-}
-
-func main() {
-    client, err := onql.Connect("localhost", 5656)
-    if err != nil { log.Fatal(err) }
-    defer client.Close()
-
-    client.Setup("mydb")
-
-    if _, err := client.Insert("users", User{Name: "John", Age: 30}); err != nil {
-        log.Fatal(err)
-    }
-
-    var users []User
-    if _, err := client.Onql(
-        client.Build("select * from users where age >= $1", 18),
-        &users,
-    ); err != nil {
-        log.Fatal(err)
-    }
-    fmt.Println(users)
-
-    client.Update("users", map[string]any{"age": 31}, map[string]any{"name": "John"})
-    client.Delete("users", map[string]any{"name": "John"})
-}
 ```
 
 ## Protocol

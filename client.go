@@ -23,7 +23,7 @@ const (
 type Response struct {
 	RequestID string
 	Source    string
-	Payload  string
+	Payload   string
 }
 
 // Option configures the client.
@@ -52,10 +52,6 @@ type pendingRequest struct {
 	ch chan *Response
 }
 
-type subscription struct {
-	callback func(rid, keyword, payload string)
-}
-
 // Client is a concurrent-safe TCP client for the ONQL server.
 type Client struct {
 	conn    net.Conn
@@ -65,15 +61,9 @@ type Client struct {
 	pending   map[string]*pendingRequest
 	pendingMu sync.Mutex
 
-	subscriptions   map[string]*subscription
-	subscriptionsMu sync.RWMutex
-
-	timeout time.Duration
-	done    chan struct{}
+	timeout   time.Duration
+	done      chan struct{}
 	closeOnce sync.Once
-
-	// db is the default database name for Insert/Update/Delete/Onql.
-	db string
 }
 
 // Connect establishes a TCP connection to the ONQL server and starts
@@ -94,22 +84,20 @@ func Connect(host string, port int, opts ...Option) (*Client, error) {
 	}
 
 	c := &Client{
-		conn:          conn,
-		writer:        bufio.NewWriterSize(conn, cfg.bufferSize),
-		pending:       make(map[string]*pendingRequest),
-		subscriptions: make(map[string]*subscription),
-		timeout:       cfg.timeout,
-		done:          make(chan struct{}),
+		conn:    conn,
+		writer:  bufio.NewWriterSize(conn, cfg.bufferSize),
+		pending: make(map[string]*pendingRequest),
+		timeout: cfg.timeout,
+		done:    make(chan struct{}),
 	}
 
 	go c.readLoop(cfg.bufferSize)
 	return c, nil
 }
 
-// generateRequestID returns a random 8-character hex string, matching the
-// Python driver's uuid4().hex[:8] approach.
+// generateRequestID returns a random 8-character hex string.
 func generateRequestID() string {
-	b := make([]byte, 4) // 4 bytes = 8 hex chars
+	b := make([]byte, 4)
 	if _, err := rand.Read(b); err != nil {
 		panic(fmt.Sprintf("onql: failed to generate request ID: %v", err))
 	}
@@ -117,7 +105,7 @@ func generateRequestID() string {
 }
 
 // readLoop continuously reads responses from the server and dispatches them
-// to the appropriate pending request channel or subscription callback.
+// to the appropriate pending request channel.
 func (c *Client) readLoop(bufferSize int) {
 	scanner := bufio.NewScanner(c.conn)
 	scanner.Buffer(make([]byte, 0, bufferSize), bufferSize)
@@ -127,22 +115,10 @@ func (c *Client) readLoop(bufferSize int) {
 		msg := scanner.Text()
 		parts := splitFields(msg)
 		if len(parts) != 3 {
-			continue // malformed
-		}
-
-		rid, source, payload := parts[0], parts[1], parts[2]
-
-		// Check subscriptions first.
-		c.subscriptionsMu.RLock()
-		sub, hasSub := c.subscriptions[rid]
-		c.subscriptionsMu.RUnlock()
-		if hasSub {
-			// Dispatch in a separate goroutine so the reader is not blocked.
-			go sub.callback(rid, source, payload)
 			continue
 		}
+		rid, source, payload := parts[0], parts[1], parts[2]
 
-		// Otherwise deliver to a pending one-shot request.
 		c.pendingMu.Lock()
 		pr, ok := c.pending[rid]
 		if ok {
@@ -154,7 +130,7 @@ func (c *Client) readLoop(bufferSize int) {
 			pr.ch <- &Response{
 				RequestID: rid,
 				Source:    source,
-				Payload:  payload,
+				Payload:   payload,
 			}
 		}
 	}
@@ -170,7 +146,6 @@ func (c *Client) readLoop(bufferSize int) {
 	close(c.done)
 }
 
-// splitOnEOM is a bufio.SplitFunc that splits on the \x04 byte.
 func splitOnEOM(data []byte, atEOF bool) (advance int, token []byte, err error) {
 	for i := 0; i < len(data); i++ {
 		if data[i] == eom {
@@ -183,7 +158,6 @@ func splitOnEOM(data []byte, atEOF bool) (advance int, token []byte, err error) 
 	return 0, nil, nil
 }
 
-// splitFields splits a message on the \x1E delimiter into exactly its parts.
 func splitFields(s string) []string {
 	var parts []string
 	start := 0
@@ -197,7 +171,6 @@ func splitFields(s string) []string {
 	return parts
 }
 
-// sendRaw writes a framed message to the server.
 func (c *Client) sendRaw(rid, keyword, payload string) error {
 	frame := rid + delimiter + keyword + delimiter + payload + string(eom)
 
@@ -247,53 +220,6 @@ func (c *Client) SendRequestTimeout(keyword, payload string, timeout time.Durati
 	}
 }
 
-// Subscribe opens a streaming subscription. The callback is invoked in its own
-// goroutine for every frame the server sends with the returned request ID.
-// The onquery and query parameters are JSON-encoded as the payload, matching
-// the Python driver's protocol.
-func (c *Client) Subscribe(onquery, query string, cb func(rid, keyword, payload string)) (string, error) {
-	rid := generateRequestID()
-
-	payloadMap := map[string]string{
-		"onquery": onquery,
-		"query":   query,
-	}
-	payloadBytes, err := json.Marshal(payloadMap)
-	if err != nil {
-		return "", fmt.Errorf("onql: failed to marshal subscribe payload: %w", err)
-	}
-
-	c.subscriptionsMu.Lock()
-	c.subscriptions[rid] = &subscription{callback: cb}
-	c.subscriptionsMu.Unlock()
-
-	if err := c.sendRaw(rid, "subscribe", string(payloadBytes)); err != nil {
-		c.subscriptionsMu.Lock()
-		delete(c.subscriptions, rid)
-		c.subscriptionsMu.Unlock()
-		return "", err
-	}
-
-	return rid, nil
-}
-
-// Unsubscribe removes a subscription and notifies the server.
-func (c *Client) Unsubscribe(rid string) error {
-	// Remove local handler first to avoid races.
-	c.subscriptionsMu.Lock()
-	delete(c.subscriptions, rid)
-	c.subscriptionsMu.Unlock()
-
-	payloadMap := map[string]string{"rid": rid}
-	payloadBytes, err := json.Marshal(payloadMap)
-	if err != nil {
-		return fmt.Errorf("onql: failed to marshal unsubscribe payload: %w", err)
-	}
-
-	// Best-effort: send unsubscribe frame to server.
-	return c.sendRaw(rid, "unsubscribe", string(payloadBytes))
-}
-
 // Close shuts down the connection and stops the reader loop.
 func (c *Client) Close() error {
 	var err error
@@ -305,14 +231,11 @@ func (c *Client) Close() error {
 
 // ---------------------------------------------------------------------------
 // Direct ORM-style API (Insert / Update / Delete / Onql / Build)
+//
+// The `path` argument is a dotted string:
+//   "mydb.users"        -> table `users` in database `mydb`
+//   "mydb.users.u1"     -> record with id `u1` in `mydb.users`
 // ---------------------------------------------------------------------------
-
-// Setup sets the default database name used by Insert/Update/Delete/Onql.
-// Returns the receiver so calls can be chained.
-func (c *Client) Setup(db string) *Client {
-	c.db = db
-	return c
-}
 
 // OnqlOption configures an optional parameter on an ORM-style call.
 type OnqlOption func(*onqlOptions)
@@ -321,7 +244,6 @@ type onqlOptions struct {
 	protopass string
 	ctxKey    string
 	ctxValues []string
-	ids       []string
 }
 
 // WithProtopass sets a custom proto-pass profile.
@@ -337,17 +259,33 @@ func WithContext(key string, values []string) OnqlOption {
 	}
 }
 
-// WithIDs sets the explicit record IDs for Update/Delete.
-func WithIDs(ids []string) OnqlOption {
-	return func(o *onqlOptions) { o.ids = ids }
-}
-
 func applyOptions(opts []OnqlOption) *onqlOptions {
-	o := &onqlOptions{protopass: "default", ctxValues: []string{}, ids: []string{}}
+	o := &onqlOptions{protopass: "default", ctxValues: []string{}}
 	for _, opt := range opts {
 		opt(o)
 	}
 	return o
+}
+
+// parsePath splits "db.table" or "db.table.id" into (db, table, id).
+// If requireID is true, the path must contain an id segment.
+func parsePath(path string, requireID bool) (db, table, id string, err error) {
+	if path == "" {
+		return "", "", "", errors.New(`onql: path must be a non-empty string like "db.table" or "db.table.id"`)
+	}
+	parts := strings.SplitN(path, ".", 3)
+	if len(parts) < 2 {
+		return "", "", "", fmt.Errorf("onql: path %q must contain at least \"db.table\"", path)
+	}
+	db = parts[0]
+	table = parts[1]
+	if len(parts) == 3 {
+		id = parts[2]
+	}
+	if requireID && id == "" {
+		return "", "", "", fmt.Errorf("onql: path %q must include a record id: \"db.table.id\"", path)
+	}
+	return
 }
 
 // envelope is the standard {error, data} response envelope.
@@ -374,12 +312,18 @@ func processResult(raw string, out interface{}) (json.RawMessage, error) {
 	return env.Data, nil
 }
 
-// Insert inserts one record or a slice of records into table.
-// `data` is marshalled as the "records" field; the returned bytes are the
-// decoded "data" field from the server envelope.
-func (c *Client) Insert(table string, data interface{}) (json.RawMessage, error) {
+// Insert inserts a single record into the table identified by `path`.
+// `path` is "db.table" (e.g. "mydb.users"); `data` is a single record
+// (struct, map, or any serde_json::Value-like type).
+func (c *Client) Insert(path string, data interface{}) (json.RawMessage, error) {
+	db, table, _, err := parsePath(path, false)
+	if err != nil {
+		return nil, err
+	}
 	payload, err := json.Marshal(map[string]interface{}{
-		"db": c.db, "table": table, "records": data,
+		"db":      db,
+		"table":   table,
+		"records": data,
 	})
 	if err != nil {
 		return nil, err
@@ -391,17 +335,21 @@ func (c *Client) Insert(table string, data interface{}) (json.RawMessage, error)
 	return processResult(resp.Payload, nil)
 }
 
-// Update updates records matching `query`.
-// Optional parameters: WithProtopass(...), WithIDs(...).
-func (c *Client) Update(table string, data, query interface{}, opts ...OnqlOption) (json.RawMessage, error) {
+// Update updates the record identified by `path` (e.g. "mydb.users.u1").
+// Optional parameters: WithProtopass(...).
+func (c *Client) Update(path string, data interface{}, opts ...OnqlOption) (json.RawMessage, error) {
+	db, table, id, err := parsePath(path, true)
+	if err != nil {
+		return nil, err
+	}
 	o := applyOptions(opts)
 	payload, err := json.Marshal(map[string]interface{}{
-		"db":        c.db,
+		"db":        db,
 		"table":     table,
 		"records":   data,
-		"query":     query,
+		"query":     "",
 		"protopass": o.protopass,
-		"ids":       o.ids,
+		"ids":       []string{id},
 	})
 	if err != nil {
 		return nil, err
@@ -413,16 +361,20 @@ func (c *Client) Update(table string, data, query interface{}, opts ...OnqlOptio
 	return processResult(resp.Payload, nil)
 }
 
-// Delete deletes records matching `query`.
-// Optional parameters: WithProtopass(...), WithIDs(...).
-func (c *Client) Delete(table string, query interface{}, opts ...OnqlOption) (json.RawMessage, error) {
+// Delete deletes the record identified by `path` (e.g. "mydb.users.u1").
+// Optional parameters: WithProtopass(...).
+func (c *Client) Delete(path string, opts ...OnqlOption) (json.RawMessage, error) {
+	db, table, id, err := parsePath(path, true)
+	if err != nil {
+		return nil, err
+	}
 	o := applyOptions(opts)
 	payload, err := json.Marshal(map[string]interface{}{
-		"db":        c.db,
+		"db":        db,
 		"table":     table,
-		"query":     query,
+		"query":     "",
 		"protopass": o.protopass,
-		"ids":       o.ids,
+		"ids":       []string{id},
 	})
 	if err != nil {
 		return nil, err
@@ -455,9 +407,8 @@ func (c *Client) Onql(query string, out interface{}, opts ...OnqlOption) (json.R
 	return processResult(resp.Payload, out)
 }
 
-// Build replaces `$1`, `$2`, ... placeholders in `query` with the supplied
-// values. Strings are double-quoted; numeric and boolean values are inlined
-// verbatim.
+// Build replaces $1, $2, ... placeholders in `query` with the supplied values.
+// Strings are double-quoted; numeric and boolean values are inlined verbatim.
 func (c *Client) Build(query string, values ...interface{}) string {
 	for i, value := range values {
 		placeholder := "$" + strconv.Itoa(i+1)
